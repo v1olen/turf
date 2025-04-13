@@ -1,7 +1,8 @@
 //! You're probably looking for `turf` instead.
 
 use convert_case::{Case, Casing};
-use std::{collections::HashMap, path::PathBuf};
+use syn::{parse_macro_input, LitStr};
+use std::{collections::HashMap, fmt::Display, path::PathBuf};
 use turf_internals::{CompiledStyleSheet, StyleSheetKind};
 
 use proc_macro::TokenStream;
@@ -65,9 +66,33 @@ pub fn style_sheet_values(input: TokenStream) -> TokenStream {
     out.into()
 }
 
+#[derive(Debug)]
+struct DummyError(pub String);
+
+impl Display for DummyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for DummyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        None
+    }
+
+    fn description(&self) -> &str {
+        &self.0
+    }
+
+    fn cause(&self) -> Option<&dyn std::error::Error> {
+        None
+    }
+}
+
 #[proc_macro]
 pub fn inline_style_sheet(input: TokenStream) -> TokenStream {
-    let input = input.to_string();
+    let input = parse_macro_input!(input as LitStr); // handles raw strings too
+    let input = input.value(); // Gets the actual string content
 
     let ProcessedStyleSheet {
         untracked_load_paths,
@@ -86,6 +111,7 @@ pub fn inline_style_sheet(input: TokenStream) -> TokenStream {
     let mut out = quote! {
         pub static STYLE_SHEET: &'static str = #css;
     };
+
     out.extend(create_classes_structure(class_names));
     out.extend(create_include_bytes(untracked_load_paths));
 
@@ -94,14 +120,16 @@ pub fn inline_style_sheet(input: TokenStream) -> TokenStream {
 
 #[proc_macro]
 pub fn inline_style_sheet_values(input: TokenStream) -> TokenStream {
-    let input = input.to_string();
+    let input = parse_macro_input!(input as LitStr); // handles raw strings too
+    let input = input.value(); // Gets the actual string content
+
 
     let ProcessedStyleSheet {
         untracked_load_paths,
         css,
         class_names,
-    } = match handle_style_sheet(StyleSheetKind::Inline(input)) {
-        Ok(result) => result,
+    } = match handle_style_sheet(StyleSheetKind::Inline(input.clone())) {
+        Ok(result) => return to_compile_error(DummyError(input)),
         Err(e) => {
             return match e {
                 Error::Turf(e) => to_compile_error(e),
@@ -275,4 +303,51 @@ mod tests {
             .to_string()
         )
     }
+}
+
+
+
+
+
+use regex::Regex;
+
+fn fix_scss(input: &str) -> String {
+    let mut output = input.to_string();
+
+    // Step 1: Remove extra spaces around colons and semicolons
+    output = output.replace(" : ", ":").replace(" ;", ";");
+
+    // Step 2: Collapse spaces around dashes (safe for properties)
+    output = output.replace(" - ", "-");
+
+    // Step 3: Fix spacing inside var() references
+    let re_var = Regex::new(r"var\s*\(\s*--\s*([a-zA-Z0-9\-]+)\s*\)").unwrap();
+    output = re_var.replace_all(&output, |caps: &regex::Captures| {
+        format!("var(--{})", &caps[1])
+    }).into_owned();
+
+    // Step 4: Fix values like -. 32px → -0.32px
+    let re_neg_dec = Regex::new(r":\s*-\.\s*(\d+)").unwrap();
+    output = re_neg_dec.replace_all(&output, ": -0.$1").into_owned();
+
+    // Step 5: Fix values like . 64px → 0.64px
+    let re_pos_dec = Regex::new(r":\s*\.\s*(\d+)").unwrap();
+    output = re_pos_dec.replace_all(&output, ": 0.$1").into_owned();
+
+    // Step 6: Remove spacing in percentages
+    let re_percent = Regex::new(r"(\d+)\s*%").unwrap(); // 115 % → 115%
+    output = re_percent.replace_all(&output, "$1%").into_owned();
+
+    let re_neg_percent = Regex::new(r"-\s*(\d+)%").unwrap(); // - 1% → -1%
+    output = re_neg_percent.replace_all(&output, "-$1%").into_owned();
+
+    // Step 7: Add line breaks before nested modifiers for readability
+    output = output.replace("&-- ", "&--");
+    output = output.replace(" __", "__");
+    output = output.replace(". ", ".");
+
+    // Step 8: Ensure proper spacing for top-level selector braces (if needed)
+    // (You might skip this if structure already valid; leaving brace logic out here intentionally)
+
+    output
 }
